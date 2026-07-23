@@ -1,0 +1,112 @@
+"""
+Engine parameter optimizer — mirrors the workbook backtest exactly.
+Walk-forward: fit on first 2/3, select by OUT-OF-SAMPLE net P&L (after costs).
+Usage on real data: export each engine's History values to CSV (one column per curve,
+same order as Curves rows) and run:  python3 optimize_engines.py mydata.csv
+"""
+import numpy as np, sys, itertools, json
+
+def kalman(y, Q, R):
+    n=len(y); mu=np.empty(n); P=np.empty(n); innov=np.zeros(n)
+    mu[0]=y[0]; P[0]=50.0
+    for t in range(1,n):
+        Pp=P[t-1]+Q; K=Pp/(Pp+R)
+        innov[t]=(y[t]-mu[t-1])/np.sqrt(Pp+R)
+        mu[t]=mu[t-1]+K*(y[t]-mu[t-1]); P[t]=(1-K)*Pp
+    return innov
+
+def hamilton_conf(y):
+    th=np.median(y)
+    for _ in range(3):
+        lo=y[y<th]; hi=y[y>=th]
+        m1,m2=lo.mean(),hi.mean(); th=(m1+m2)/2
+    s1=max(y[y<th].std(),1e-4); s2=max(y[y>=th].std(),1e-4)
+    st=(y>=th).astype(int)
+    p11=max(min(((st[:-1]==0)&(st[1:]==0)).sum()/max((st[:-1]==0).sum(),1),0.995),0.005)
+    p22=max(min(((st[:-1]==1)&(st[1:]==1)).sum()/max((st[:-1]==1).sum(),1),0.995),0.005)
+    n=len(y); P1=np.empty(n)
+    p=(1-p22)/((1-p11)+(1-p22))
+    for t in range(n):
+        f1=np.exp(-0.5*((y[t]-m1)/s1)**2)/s1; f2=np.exp(-0.5*((y[t]-m2)/s2)**2)/s2
+        pp=p if t==0 else P1[t-1]*p11+(1-P1[t-1])*(1-p22)
+        P1[t]=f1*pp/max(f1*pp+f2*(1-pp),1e-300)
+    return np.maximum(P1,1-P1)
+
+def backtest(y, z, score, dirsig, ent_scale, tgt, stopz, mh, scoreE, cost, t0, t1):
+    """entries on score crossing >= scoreE within [t0,t1); exit target/stop/timeout on z."""
+    pnl=[]; wins=0
+    t=t0+1
+    n=len(y)
+    while t<t1:
+        if not (np.isfinite(score[t]) and np.isfinite(score[t-1])): t+=1; continue
+        if score[t-1]<scoreE<=score[t] and np.isfinite(z[t]):
+            d=np.sign(z[t]) or 1.0
+            estop=max(stopz,abs(z[t])+0.5)
+            exit_t=None
+            for u in range(t+1,min(t+mh,n-1)+1):
+                if not np.isfinite(z[u]): continue
+                if (d==1 and z[u]<=tgt) or (d==-1 and z[u]>=-tgt): exit_t=u; break
+                if (d==1 and z[u]>=estop) or (d==-1 and z[u]<=-estop): exit_t=u; break
+            if exit_t is None: exit_t=min(t+mh,n-1)
+            p=d*(y[t]-y[exit_t])-cost
+            pnl.append(p); wins+=p>0
+            t=exit_t+1
+        else: t+=1
+    pnl=np.array(pnl)
+    return len(pnl), (wins/len(pnl) if len(pnl) else np.nan), pnl.sum() if len(pnl) else 0.0
+
+def optimize(y, name, cost, ent_default):
+    n=len(y); N=120; split=int(n*2/3)
+    grids=dict(ent=[1.0,1.25,1.5,1.75], tgt=[0.25,0.5], stopz=[2.5,3.0,3.5],
+               mh=[30,60,90], scoreE=[60,70,80], Q=[0.3,0.5,1.0], R=[2.0,3.0,5.0])
+    rm=np.full(n,np.nan); rs=np.full(n,np.nan)
+    for t in range(N-1,n):
+        w=y[t-N+1:t+1]; rm[t]=w.mean(); rs[t]=w.std(ddof=1)
+    z=(y-rm)/rs
+    conf=hamilton_conf(y)
+    best=None
+    for Q,R in itertools.product(grids["Q"],grids["R"]):
+        kz=kalman(y,Q,R)
+        painpart=np.minimum(1,np.abs(kz)/2.5)
+        for ent in grids["ent"]:
+            zpart=np.minimum(1,np.abs(z)/(1.6667*ent))
+            score=np.minimum(100,(0.65*100*(0.55*zpart+0.45*painpart)+0.35*50)*(0.5+0.5*conf))
+            score[~np.isfinite(z)]=np.nan
+            for tgt,stopz,mh,scoreE in itertools.product(grids["tgt"],grids["stopz"],grids["mh"],grids["scoreE"]):
+                nIS,wIS,pIS=backtest(y,z,score,None,ent,tgt,stopz,mh,scoreE,cost,N,split)
+                if nIS<10: continue
+                nOS,wOS,pOS=backtest(y,z,score,None,ent,tgt,stopz,mh,scoreE,cost,split,n)
+                if nOS<4: continue
+                key=(pOS,pIS)
+                if best is None or key>best[0]:
+                    best=(key,dict(ent=ent,tgt=tgt,stopz=stopz,mh=mh,scoreE=scoreE,Q=Q,R=R,
+                                   nIS=nIS,wIS=wIS,pIS=pIS,nOS=nOS,wOS=wOS,pOS=pOS))
+    # default comparison
+    kz=kalman(y,0.5,3.0); painpart=np.minimum(1,np.abs(kz)/2.5)
+    zpart=np.minimum(1,np.abs(z)/(1.6667*ent_default))
+    score=np.minimum(100,(0.65*100*(0.55*zpart+0.45*painpart)+0.35*50)*(0.5+0.5*conf))
+    score[~np.isfinite(z)]=np.nan
+    nD,wD,pD=backtest(y,z,score,None,ent_default,0.5,3.0,60,70,cost,N,n)
+    return best[1] if best else None, dict(n=nD,w=wD,p=pD)
+
+if __name__=="__main__":
+    if len(sys.argv)>1:
+        data=np.genfromtxt(sys.argv[1],delimiter=",",skip_header=1).T
+        names=[f"col{i}" for i in range(len(data))]
+    else:
+        data=np.load("six.npy"); names=json.load(open("six_names.json"))
+    costs=[1.0,1.0,1.0,1.0,0.6,0.6]        # round-trip bp: curves 2×0.5, flies 2×0.3
+    entd=[1.5,1.5,1.5,1.5,1.2,1.2]
+    out={}
+    print(f"{'inst':<10}{'ent':>5}{'tgt':>5}{'stop':>5}{'hold':>5}{'scE':>4}{'Q':>5}{'R':>4} | "
+          f"{'IS n/win/P&L':>16} | {'OOS n/win/P&L':>16} | default full-P&L")
+    for k,(nm,y) in enumerate(zip(names,data)):
+        b,dflt=optimize(np.asarray(y,float),nm,costs[k],entd[k])
+        if b is None:
+            print(f"{nm:<10}  no admissible parameter set (too few trades)"); continue
+        out[nm]=b
+        print(f"{nm:<10}{b['ent']:>5.2f}{b['tgt']:>5.2f}{b['stopz']:>5.1f}{b['mh']:>5d}{b['scoreE']:>4d}"
+              f"{b['Q']:>5.1f}{b['R']:>4.1f} | {b['nIS']:>3d} {b['wIS']:>5.0%} {b['pIS']:>+6.1f} | "
+              f"{b['nOS']:>3d} {b['wOS']:>5.0%} {b['pOS']:>+6.1f} | n={dflt['n']} {dflt['p']:+.1f}bp")
+    json.dump(out,open("optimal_params.json","w"),indent=1)
+    print("\nsaved optimal_params.json — type these into each engine's yellow cells (B5,B6,B7,B8,B13,B10,B11)")
